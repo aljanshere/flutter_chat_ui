@@ -43,8 +43,9 @@ enum InitialScrollToEndMode {
 ///   (newer messages). Uses [startPaginationThreshold] to control trigger sensitivity.
 ///
 /// For optimal performance and user experience, end pagination uses a very small
-/// threshold (0.01) to ensure accurate scroll anchoring, while start pagination
-/// can use a higher threshold (0.8) since it doesn't require complex anchoring.
+/// threshold (0.01) to ensure accurate scroll anchoring. Start pagination uses
+/// a higher threshold (0.8) and includes scroll position management to prevent
+/// bouncing when new messages are loaded.
 class ChatAnimatedList extends StatefulWidget {
   /// Builder function for creating individual chat message widgets.
   final ChatItem itemBuilder;
@@ -899,8 +900,43 @@ class _ChatAnimatedListState extends State<ChatAnimatedList>
       // Prevent multiple triggers during one scroll gesture.
       _startPaginationShouldTrigger = false;
 
-      // For start pagination, we typically don't need complex scroll anchoring
-      // since new messages are added at the end and user stays at bottom.
+      // Store scroll position info before loading new messages to prevent bouncing
+      final wasAtBottom = _isAtChatEndScrollPosition;
+      final currentScrollOffset = _scrollController.offset;
+      final currentMaxScrollExtent = _scrollController.position.maxScrollExtent;
+      MessageID? anchorMessageId;
+      int? initialMessagesCount;
+
+      // --- Scroll Anchoring Setup: Anchor to bottommost visible item ---
+      if (!wasAtBottom) {
+        try {
+          final notificationResult = await _observerController
+              .dispatchOnceObserve(
+                sliverContext: _sliverListViewContext!,
+                isForce: true,
+                isDependObserveCallback: false,
+              );
+          final lastItem =
+              notificationResult
+                  .observeResult
+                  ?.innerDisplayingChildModelList
+                  .lastOrNull;
+          final anchorIndex = lastItem?.index;
+
+          if (anchorIndex != null &&
+              anchorIndex >= 0 &&
+              anchorIndex < _oldList.length) {
+            anchorMessageId = _oldList[anchorIndex].id;
+          }
+        } catch (e) {
+          debugPrint(
+            'Error observing scroll position for start pagination anchoring: $e',
+          );
+        }
+        if (!mounted) return;
+        initialMessagesCount = _oldList.length;
+      }
+      // --- End Scroll Anchoring Setup ---
 
       // Ensure mounted before using context or calling async widget callbacks
       if (!mounted) return;
@@ -919,6 +955,52 @@ class _ChatAnimatedListState extends State<ChatAnimatedList>
         if (!_scrollController.hasClients || !mounted) return;
 
         final notifier = context.read<LoadMoreNotifier>();
+
+        // --- Scroll Position Management ---
+        final didAddMessages =
+            _oldList.length > (initialMessagesCount ?? _oldList.length);
+
+        if (didAddMessages) {
+          if (wasAtBottom) {
+            // User was at bottom, auto-scroll to new bottom to show new messages
+            if (widget.scrollToEndAnimationDuration == Duration.zero) {
+              _scrollController.jumpTo(_chatEndScrollPosition);
+            } else {
+              _scrollController.animateTo(
+                _chatEndScrollPosition,
+                duration: widget.scrollToEndAnimationDuration,
+                curve: Curves.linearToEaseOut,
+              );
+            }
+          } else if (anchorMessageId != null) {
+            // User was scrolled up, maintain their position using anchor
+            final newIndex = _oldList.indexWhere(
+              (m) => m.id == anchorMessageId,
+            );
+            if (newIndex != -1) {
+              _scrollToIndex(
+                newIndex,
+                duration: Duration.zero, // Jump immediately to prevent bouncing
+                alignment:
+                    1, // Align to the bottom edge (since we anchored to last visible)
+                offset: 0,
+              );
+            }
+          } else {
+            // Fallback: try to maintain relative scroll position
+            final newMaxScrollExtent =
+                _scrollController.position.maxScrollExtent;
+            if (newMaxScrollExtent > currentMaxScrollExtent) {
+              final scrollDifference =
+                  newMaxScrollExtent - currentMaxScrollExtent;
+              final newScrollOffset = currentScrollOffset + scrollDifference;
+              _scrollController.jumpTo(
+                newScrollOffset.clamp(0.0, newMaxScrollExtent),
+              );
+            }
+          }
+        }
+        // --- End Scroll Position Management ---
 
         // Hide loading indicator.
         notifier.setLoading(false);
