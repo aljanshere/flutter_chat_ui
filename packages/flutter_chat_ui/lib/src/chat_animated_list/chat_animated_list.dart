@@ -30,9 +30,21 @@ enum InitialScrollToEndMode {
 
 /// An animated list widget specifically designed for displaying chat messages.
 ///
-/// Handles message insertion/removal animations, pagination (loading older messages),
-/// automatic scrolling, keyboard handling, and scroll-to-bottom functionality.
-/// It listens to a [ChatController] for message updates.
+/// Handles message insertion/removal animations, bidirectional pagination
+/// (loading older and newer messages), automatic scrolling, keyboard handling,
+/// and scroll-to-bottom functionality. It listens to a [ChatController] for message updates.
+///
+/// ## Bidirectional Pagination
+///
+/// This widget supports pagination in both directions:
+/// - **End Pagination**: Triggered by [onEndReached] when scrolling towards the top
+///   (older messages). Uses [paginationThreshold] to control trigger sensitivity.
+/// - **Start Pagination**: Triggered by [onStartReached] when scrolling towards the bottom
+///   (newer messages). Uses [startPaginationThreshold] to control trigger sensitivity.
+///
+/// For optimal performance and user experience, end pagination uses a very small
+/// threshold (0.01) to ensure accurate scroll anchoring, while start pagination
+/// can use a higher threshold (0.8) since it doesn't require complex anchoring.
 class ChatAnimatedList extends StatefulWidget {
   /// Builder function for creating individual chat message widgets.
   final ChatItem itemBuilder;
@@ -98,10 +110,18 @@ class ChatAnimatedList extends StatefulWidget {
   /// Callback triggered when the user scrolls near the top, requesting older messages.
   final PaginationCallback? onEndReached;
 
+  /// Callback triggered when the user scrolls near the bottom, requesting newer messages.
+  final PaginationCallback? onStartReached;
+
   /// Threshold for triggering pagination, represented as a value between 0 and 1.
   /// 0 represents the top of the list, while 1 represents the bottom.
   /// A value of 0.2 means pagination will trigger when scrolled to 20% from the top.
   final double? paginationThreshold;
+
+  /// Threshold for triggering start pagination, represented as a value between 0 and 1.
+  /// 0 represents the top of the list, while 1 represents the bottom.
+  /// A value of 0.8 means start pagination will trigger when scrolled to 80% from the top.
+  final double? startPaginationThreshold;
 
   /// Timeout in seconds for grouping consecutive messages from the same author.
   final int? messageGroupingTimeoutInSeconds;
@@ -132,7 +152,8 @@ class ChatAnimatedList extends StatefulWidget {
     this.shouldScrollToEndWhenSendingMessage = true,
     this.shouldScrollToEndWhenAtBottom = true,
     this.onEndReached,
-    // Threshold for triggering pagination, represented as a value between 0 (top)
+    this.onStartReached,
+    // Threshold for triggering end pagination, represented as a value between 0 (top)
     // and 1 (bottom).
     //
     // IMPORTANT: This value defaults to a very small number (e.g., 0.01 or 1%)
@@ -154,6 +175,14 @@ class ChatAnimatedList extends StatefulWidget {
     // Modify this value at your own risk. If you increase it and experience
     // unstable pagination jumps, revert to a smaller value like 0.01.
     this.paginationThreshold = 0.01,
+    // Threshold for triggering start pagination (newer messages), represented as
+    // a value between 0 (top) and 1 (bottom). A value of 0.8 means start pagination
+    // will trigger when scrolled to 80% from the top (near the bottom).
+    //
+    // Unlike end pagination, this can typically use a higher threshold value since
+    // start pagination loads newer messages at the bottom/end of the list, which
+    // doesn't require complex scroll anchoring to maintain position.
+    this.startPaginationThreshold = 0.8,
     this.messageGroupingTimeoutInSeconds,
     this.physics,
   });
@@ -192,11 +221,16 @@ class _ChatAnimatedListState extends State<ChatAnimatedList>
   // scroll position (so we can see latest messages when we enter chat)
   late bool _needsInitialScrollPositionAdjustment;
   MessageID _lastInsertedMessageId = '';
-  // Controls whether pagination should be triggered when scrolling to the top.
+  // Controls whether end pagination should be triggered when scrolling to the top.
   // Set to true when user scrolls up, and false after pagination is triggered.
   // This prevents infinite pagination loops when reaching the end of available messages,
   // ensuring onEndReached only fires once per user scroll gesture.
-  bool _paginationShouldTrigger = false;
+  bool _endPaginationShouldTrigger = false;
+  // Controls whether start pagination should be triggered when scrolling to the bottom.
+  // Set to true when user scrolls down, and false after pagination is triggered.
+  // This prevents infinite pagination loops when reaching the start of available messages,
+  // ensuring onStartReached only fires once per user scroll gesture.
+  bool _startPaginationShouldTrigger = false;
 
   @override
   void initState() {
@@ -371,6 +405,7 @@ class _ChatAnimatedListState extends State<ChatAnimatedList>
         return <Widget>[
           // Visually at the bottom (first in sliver list for reverse: true)
           _buildComposerHeightSliver(context),
+          if (widget.onStartReached != null) _buildLoadMoreSliver(builders),
           if (widget.bottomSliver != null) widget.bottomSliver!,
           sliverAnimatedList,
           if (widget.onEndReached != null) _buildLoadMoreSliver(builders),
@@ -389,6 +424,7 @@ class _ChatAnimatedListState extends State<ChatAnimatedList>
           if (widget.onEndReached != null) _buildLoadMoreSliver(builders),
           sliverAnimatedList,
           if (widget.bottomSliver != null) widget.bottomSliver!,
+          if (widget.onStartReached != null) _buildLoadMoreSliver(builders),
           _buildComposerHeightSliver(context),
           // Visually at the bottom
         ];
@@ -405,12 +441,20 @@ class _ChatAnimatedListState extends State<ChatAnimatedList>
         }
 
         if (notification is UserScrollNotification) {
-          // When user scrolls up, save it to `_userHasScrolled`
+          // Handle scroll direction changes for pagination triggers
           if (notification.direction ==
               (widget.reversed
                   ? ScrollDirection.reverse
                   : ScrollDirection.forward)) {
-            _paginationShouldTrigger = true;
+            // User scrolled up (towards older messages)
+            _endPaginationShouldTrigger = true;
+            _userHasScrolled = true;
+          } else if (notification.direction ==
+              (widget.reversed
+                  ? ScrollDirection.forward
+                  : ScrollDirection.reverse)) {
+            // User scrolled down (towards newer messages)
+            _startPaginationShouldTrigger = true;
             _userHasScrolled = true;
           } else {
             // When user overscolls to the bottom or stays idle at the bottom, set `_userHasScrolled` to false
@@ -710,13 +754,24 @@ class _ChatAnimatedListState extends State<ChatAnimatedList>
     if (!_scrollController.hasClients ||
         !mounted ||
         _needsInitialScrollPositionAdjustment ||
-        widget.onEndReached == null ||
-        context.read<LoadMoreNotifier>().isLoading ||
-        !_paginationShouldTrigger) {
+        context.read<LoadMoreNotifier>().isLoading) {
       return;
     }
 
-    // Get the threshold for pagination, defaulting to the very top of the list
+    // Handle end pagination (loading older messages)
+    if (widget.onEndReached != null && _endPaginationShouldTrigger) {
+      await _handleEndPagination();
+    }
+
+    // Handle start pagination (loading newer messages)
+    if (widget.onStartReached != null && _startPaginationShouldTrigger) {
+      await _handleStartPagination();
+    }
+  }
+
+  /// Handles pagination for loading older messages (end pagination).
+  Future<void> _handleEndPagination() async {
+    // Get the threshold for end pagination, defaulting to the very top of the list
     var threshold = (widget.paginationThreshold ?? 0);
     if (widget.reversed) {
       threshold = 1 - threshold;
@@ -739,7 +794,7 @@ class _ChatAnimatedListState extends State<ChatAnimatedList>
     // Trigger pagination if user scrolled past the threshold towards the top.
     if (shouldTrigger) {
       // Prevent multiple triggers during one scroll gesture.
-      _paginationShouldTrigger = false;
+      _endPaginationShouldTrigger = false;
 
       // Store the ID of the topmost visible item before loading new messages.
       // This item will be used as an anchor to maintain scroll position.
@@ -812,6 +867,58 @@ class _ChatAnimatedListState extends State<ChatAnimatedList>
           }
         }
         // --- End Scroll Anchoring Action ---
+
+        // Hide loading indicator.
+        notifier.setLoading(false);
+      });
+    }
+  }
+
+  /// Handles pagination for loading newer messages (start pagination).
+  Future<void> _handleStartPagination() async {
+    // Get the threshold for start pagination, defaulting to near the bottom of the list
+    var threshold = (widget.startPaginationThreshold ?? 0.8);
+    if (widget.reversed) {
+      threshold = 1 - threshold;
+    }
+
+    // Calculate the user's scroll position as a percentage of the total scrollable area, ranging from 0 to 1.
+    final scrollPercentage =
+        _scrollController.position.maxScrollExtent == 0
+            ? 0
+            : _scrollController.offset /
+                _scrollController.position.maxScrollExtent;
+
+    final shouldTrigger =
+        widget.reversed
+            ? scrollPercentage <= threshold
+            : scrollPercentage >= threshold;
+
+    // Trigger pagination if user scrolled past the threshold towards the bottom.
+    if (shouldTrigger) {
+      // Prevent multiple triggers during one scroll gesture.
+      _startPaginationShouldTrigger = false;
+
+      // For start pagination, we typically don't need complex scroll anchoring
+      // since new messages are added at the end and user stays at bottom.
+
+      // Ensure mounted before using context or calling async widget callbacks
+      if (!mounted) return;
+
+      // Show loading indicator.
+      context.read<LoadMoreNotifier>().setLoading(true);
+
+      // Load newer messages.
+      await widget.onStartReached!();
+
+      // Ensure mounted after await, as onStartReached might unmount the widget
+      if (!mounted) return;
+
+      // Wait for the next frame for UI updates.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!_scrollController.hasClients || !mounted) return;
+
+        final notifier = context.read<LoadMoreNotifier>();
 
         // Hide loading indicator.
         notifier.setLoading(false);
